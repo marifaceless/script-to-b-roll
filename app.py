@@ -16,6 +16,7 @@ import shutil
 import uuid
 from PIL import Image
 import numpy as np
+import random
 
 # Download required NLTK data
 try:
@@ -38,6 +39,8 @@ if 'zip_data' not in st.session_state:
     st.session_state.zip_data = None
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
+if 'api_retry_count' not in st.session_state:
+    st.session_state.api_retry_count = 0
 
 # API key - use environment variable or secret
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "hbweXH4FwEDRICQK1bl0SyYygAOlHDeKZJc9ZPL6HOFym1NxXQNeNE9S")
@@ -46,6 +49,11 @@ PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "hbweXH4FwEDRICQK1bl0SyYygAOlH
 POLITICAL_THEMES = ["city", "urban", "government", "political", "country", "nation", 
                     "capital", "downtown", "skyline", "politics", "international", 
                     "global", "metropolis", "cityscape", "buildings", "architecture"]
+
+# Rate limiting parameters
+MAX_RETRIES = 5
+BASE_DELAY = 2  # Initial delay in seconds
+MAX_DELAY = 60  # Maximum delay in seconds
 
 def parse_script_into_segments(script_text: str, segment_duration: int = 5) -> List[str]:
     """
@@ -153,7 +161,49 @@ def calculate_video_score(video: Dict, segment: str) -> float:
             
     return score
 
-def search_pexels_videos(query: str, per_page: int = 15, segment: str = "") -> List[Dict[Any, Any]]:
+def api_request_with_backoff(url: str, headers: Dict[str, str]) -> Dict:
+    """Make API request with exponential backoff for rate limiting."""
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            # Add small jitter to avoid synchronized requests when processing multiple segments
+            time.sleep(random.uniform(1.5, 3.0) * (retry_count + 1))
+            
+            response = requests.get(url, headers=headers)
+            
+            # If successful, return the data
+            if response.status_code == 200:
+                return response.json()
+                
+            # If rate limited, wait and retry
+            if response.status_code == 429:
+                # Calculate backoff time with exponential increase and jitter
+                delay = min(BASE_DELAY * (2 ** retry_count) + random.uniform(0, 1), MAX_DELAY)
+                st.warning(f"Rate limit reached. Waiting {delay:.1f} seconds before retrying...")
+                time.sleep(delay)
+                retry_count += 1
+                st.session_state.api_retry_count += 1
+                continue
+                
+            # For other errors, raise exception
+            response.raise_for_status()
+            
+        except requests.exceptions.RequestException as e:
+            # If we've exceeded retries or it's not a rate limit issue, raise error
+            if retry_count >= MAX_RETRIES - 1 or "429" not in str(e):
+                raise e
+            
+            # For rate limit errors, retry with backoff
+            delay = min(BASE_DELAY * (2 ** retry_count) + random.uniform(0, 1), MAX_DELAY)
+            st.warning(f"Rate limit reached. Waiting {delay:.1f} seconds before retrying...")
+            time.sleep(delay)
+            retry_count += 1
+            st.session_state.api_retry_count += 1
+    
+    # If we've exhausted retries
+    raise Exception(f"Failed after {MAX_RETRIES} retries due to rate limiting")
+
+def search_pexels_videos(query: str, per_page: int = 8, segment: str = "") -> List[Dict[Any, Any]]:
     """Search Pexels API for 16:9 videos matching the query with political/city bias."""
     # Add political/city bias to search query
     biased_query = query
@@ -166,9 +216,8 @@ def search_pexels_videos(query: str, per_page: int = 15, segment: str = "") -> L
     headers = {"Authorization": PEXELS_API_KEY}
     
     try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+        # Use backoff strategy for API request
+        data = api_request_with_backoff(url, headers)
         videos = data.get("videos", [])
         
         # Filter for 16:9 videos only
@@ -182,16 +231,21 @@ def search_pexels_videos(query: str, per_page: int = 15, segment: str = "") -> L
                 if video.get("duration", 0) <= 15:
                     filtered_videos.append(video)
         
-        # If we don't have enough 16:9 videos, get more
-        if len(filtered_videos) < 4 and "next_page" in data:
-            more_videos = search_pexels_videos_by_url(data["next_page"], headers)
-            for video in more_videos:
-                width = video.get("width", 0)
-                height = video.get("height", 0)
-                if is_16_9_aspect_ratio(width, height) and video.get("duration", 0) <= 15:
-                    filtered_videos.append(video)
-                    if len(filtered_videos) >= 8:  # Get more videos to choose from
-                        break
+        # If we don't have enough 16:9 videos and have a next page, get more
+        # But only if we haven't hit too many rate limits
+        if len(filtered_videos) < 3 and "next_page" in data and st.session_state.api_retry_count < 5:
+            try:
+                more_videos = search_pexels_videos_by_url(data["next_page"], headers)
+                for video in more_videos:
+                    width = video.get("width", 0)
+                    height = video.get("height", 0)
+                    if is_16_9_aspect_ratio(width, height) and video.get("duration", 0) <= 15:
+                        filtered_videos.append(video)
+                        if len(filtered_videos) >= 4:  # Get enough videos to choose from
+                            break
+            except Exception as e:
+                # If getting more videos fails, just continue with what we have
+                st.warning(f"Couldn't get additional videos: {str(e)}")
         
         # Score and sort videos for best fit if segment is provided
         if segment:
@@ -207,17 +261,35 @@ def search_pexels_videos(query: str, per_page: int = 15, segment: str = "") -> L
 def search_pexels_videos_by_url(url: str, headers: Dict[str, str]) -> List[Dict[Any, Any]]:
     """Search Pexels API using a specific URL (for pagination)."""
     try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+        # Use backoff strategy for API request
+        data = api_request_with_backoff(url, headers)
         return data.get("videos", [])
-    except Exception:
+    except Exception as e:
+        st.warning(f"Error in pagination request: {str(e)}")
         return []
 
 def download_video(url: str) -> bytes:
     """Download video from URL."""
-    response = requests.get(url)
-    return response.content
+    # Add retry logic for downloads too
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            response = requests.get(url, timeout=30)  # Add timeout
+            response.raise_for_status()
+            return response.content
+        except requests.exceptions.RequestException as e:
+            retry_count += 1
+            if retry_count >= max_retries:
+                raise Exception(f"Failed to download video after {max_retries} attempts: {str(e)}")
+            
+            # Wait before retrying
+            delay = 2 ** retry_count  # Exponential backoff
+            time.sleep(delay)
+    
+    # Should not reach here, but just in case
+    raise Exception("Failed to download video for unknown reason")
 
 def trim_video(video_data: bytes, start_time: float = 0, duration: float = 5) -> bytes:
     """Trim the video to the specified duration using FFmpeg."""
@@ -249,6 +321,7 @@ def trim_video(video_data: bytes, start_time: float = 0, duration: float = 5) ->
         
         if result.returncode != 0:
             # If FFmpeg fails, return the original video
+            st.warning("Video trimming failed with FFmpeg. Using original video.")
             return video_data
         
         # Read the trimmed video
@@ -293,6 +366,9 @@ def auto_select_best_video(segment_key: str, videos: List[Dict[Any, Any]]) -> Di
 
 def process_script(script_text: str, segment_duration: int) -> None:
     """Process the entire script and automatically prepare videos for download."""
+    # Reset retry counter at the start of processing
+    st.session_state.api_retry_count = 0
+    
     # Parse script into segments
     segments = parse_script_into_segments(script_text, segment_duration)
     st.session_state.segments = segments
@@ -335,12 +411,26 @@ def process_script(script_text: str, segment_duration: int) -> None:
             best_video = auto_select_best_video(segment_key, videos)
             
             if best_video:
+                # Find the best video file (HD if available)
+                video_files = best_video.get("video_files", [])
+                video_url = ""
+                
+                # Try to find HD file first
+                for file in video_files:
+                    if file.get("quality") == "hd":
+                        video_url = file.get("link", "")
+                        break
+                
+                # If no HD file, get the first one
+                if not video_url and video_files:
+                    video_url = video_files[0].get("link", "")
+                
                 # Create video info dictionary
                 video_info = {
                     "segment": i+1,
                     "segment_text": segment,
                     "video_id": 1,  # Always 1 since we're only selecting the best
-                    "url": best_video.get("video_files", [{}])[0].get("link", ""),
+                    "url": video_url,
                     "filename": f"segment_{i+1}.mp4",
                     "duration": best_video.get("duration", 0),
                     "score": best_video.get("score", 0),
@@ -354,8 +444,10 @@ def process_script(script_text: str, segment_duration: int) -> None:
                 st.session_state.selected_videos[segment_key] = [video_info]
                 st.session_state.all_videos.append(video_info)
             
-            # Sleep to avoid hitting API rate limits
-            time.sleep(0.5)
+            # Sleep between segments to avoid hitting rate limits
+            # Add longer sleep if we've had API retry issues
+            sleep_time = 2.0 + (st.session_state.api_retry_count * 0.5)
+            time.sleep(sleep_time)
         
         # Second phase: downloading and trimming
         video_data = []
@@ -389,6 +481,9 @@ def process_script(script_text: str, segment_duration: int) -> None:
                     "filename": video_info["filename"],
                     "data": data
                 })
+                
+                # Sleep between downloads to avoid overloading
+                time.sleep(1.0)
                 
             except Exception as e:
                 st.error(f"Error processing video for segment {i+1}: {str(e)}")
@@ -453,6 +548,7 @@ with col1:
         st.session_state.all_videos = []
         st.session_state.zip_data = None
         st.session_state.processing_complete = False
+        st.session_state.api_retry_count = 0
         st.experimental_rerun()
 
 with col2:
@@ -510,6 +606,10 @@ elif not st.session_state.searched:
     #### Note:
     This app uses the Pexels API to find free stock footage. Make sure to credit Pexels and the video creators when using the footage.
     """)
+
+# Add note about API rate limiting
+if st.session_state.api_retry_count > 0:
+    st.warning(f"Note: API rate limiting was encountered {st.session_state.api_retry_count} times during processing. If you experience issues, please try again later or with a smaller script.")
 
 # Footer with attribution
 st.markdown("---")
