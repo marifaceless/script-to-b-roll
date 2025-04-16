@@ -10,12 +10,34 @@ import io
 import base64
 from typing import List, Dict, Any
 import math
+import tempfile
+import subprocess
+import shutil
+import uuid
+from PIL import Image
+import numpy as np
 
 # Download required NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
+
+# Initialize session state for persisting data between reruns
+if 'selected_videos' not in st.session_state:
+    st.session_state.selected_videos = {}
+if 'segments' not in st.session_state:
+    st.session_state.segments = []
+if 'searched' not in st.session_state:
+    st.session_state.searched = False
+if 'segment_videos' not in st.session_state:
+    st.session_state.segment_videos = {}
+if 'all_videos' not in st.session_state:
+    st.session_state.all_videos = []
+if 'zip_data' not in st.session_state:
+    st.session_state.zip_data = None
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
 
 # API key - use environment variable or secret
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "hbweXH4FwEDRICQK1bl0SyYygAOlHDeKZJc9ZPL6HOFym1NxXQNeNE9S")
@@ -94,7 +116,44 @@ def is_16_9_aspect_ratio(width: int, height: int, tolerance: float = 0.1) -> boo
     actual_ratio = width / height if height != 0 else 0
     return abs(actual_ratio - target_ratio) <= tolerance
 
-def search_pexels_videos(query: str, per_page: int = 10) -> List[Dict[Any, Any]]:
+def calculate_video_score(video: Dict, segment: str) -> float:
+    """Calculate a score for a video based on various factors to determine best fit."""
+    score = 0.0
+    
+    # Prefer videos with duration close to 5 seconds
+    duration = video.get("duration", 0)
+    if 3 <= duration <= 5:
+        score += 5.0  # Perfect duration
+    elif 5 < duration <= 10:
+        score += 3.0  # Good duration that can be trimmed
+    elif duration > 10:
+        score += 1.0  # Can be trimmed but not ideal
+        
+    # Higher resolution is better
+    width = video.get("width", 0)
+    if width >= 1920:
+        score += 2.0  # Full HD or better
+    elif width >= 1280:
+        score += 1.5  # HD
+        
+    # Prefer videos with certain keywords in title/description
+    video_text = (video.get("user", {}).get("name", "") + " " + 
+                 video.get("url", "")).lower()
+    
+    # Check if video contains political/city keywords
+    for theme in POLITICAL_THEMES:
+        if theme in video_text:
+            score += 0.5
+            
+    # Check if segment keywords are in video text
+    segment_keywords = extract_keywords(segment)
+    for keyword in segment_keywords:
+        if keyword in video_text:
+            score += 1.0
+            
+    return score
+
+def search_pexels_videos(query: str, per_page: int = 15, segment: str = "") -> List[Dict[Any, Any]]:
     """Search Pexels API for 16:9 videos matching the query with political/city bias."""
     # Add political/city bias to search query
     biased_query = query
@@ -119,7 +178,9 @@ def search_pexels_videos(query: str, per_page: int = 10) -> List[Dict[Any, Any]]
             height = video.get("height", 0)
             
             if is_16_9_aspect_ratio(width, height):
-                filtered_videos.append(video)
+                # Filter for videos shorter than 15 seconds (easier to trim to 3-5s)
+                if video.get("duration", 0) <= 15:
+                    filtered_videos.append(video)
         
         # If we don't have enough 16:9 videos, get more
         if len(filtered_videos) < 4 and "next_page" in data:
@@ -127,10 +188,16 @@ def search_pexels_videos(query: str, per_page: int = 10) -> List[Dict[Any, Any]]
             for video in more_videos:
                 width = video.get("width", 0)
                 height = video.get("height", 0)
-                if is_16_9_aspect_ratio(width, height):
+                if is_16_9_aspect_ratio(width, height) and video.get("duration", 0) <= 15:
                     filtered_videos.append(video)
-                    if len(filtered_videos) >= 4:
+                    if len(filtered_videos) >= 8:  # Get more videos to choose from
                         break
+        
+        # Score and sort videos for best fit if segment is provided
+        if segment:
+            for video in filtered_videos:
+                video["score"] = calculate_video_score(video, segment)
+            filtered_videos.sort(key=lambda x: x.get("score", 0), reverse=True)
         
         return filtered_videos[:4]  # Return at most 4 videos
     except Exception as e:
@@ -152,6 +219,51 @@ def download_video(url: str) -> bytes:
     response = requests.get(url)
     return response.content
 
+def trim_video(video_data: bytes, start_time: float = 0, duration: float = 5) -> bytes:
+    """Trim the video to the specified duration using FFmpeg."""
+    try:
+        # Create temporary files
+        temp_dir = tempfile.mkdtemp()
+        input_path = os.path.join(temp_dir, "input.mp4")
+        output_path = os.path.join(temp_dir, "output.mp4")
+        
+        # Write input video to temp file
+        with open(input_path, "wb") as f:
+            f.write(video_data)
+        
+        # Trim the video using FFmpeg
+        cmd = [
+            "ffmpeg", 
+            "-i", input_path, 
+            "-ss", str(start_time), 
+            "-t", str(duration), 
+            "-c:v", "libx264", 
+            "-c:a", "aac", 
+            "-strict", "experimental", 
+            "-b:a", "128k", 
+            output_path
+        ]
+        
+        # Run command with suppressed output
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        if result.returncode != 0:
+            # If FFmpeg fails, return the original video
+            return video_data
+        
+        # Read the trimmed video
+        with open(output_path, "rb") as f:
+            trimmed_data = f.read()
+        
+        # Clean up temp files
+        shutil.rmtree(temp_dir)
+        
+        return trimmed_data
+    except Exception as e:
+        # If anything goes wrong, return the original video
+        st.warning(f"Video trimming failed: {str(e)}. Using original video.")
+        return video_data
+
 def create_zip_file(video_data: List[Dict[str, bytes]]) -> bytes:
     """Create a zip file containing all downloaded videos."""
     zip_buffer = io.BytesIO()
@@ -165,22 +277,30 @@ def create_zip_file(video_data: List[Dict[str, bytes]]) -> bytes:
 def get_download_link(zip_data: bytes, filename: str) -> str:
     """Generate a download link for the zip file."""
     b64_data = base64.b64encode(zip_data).decode()
-    href = f'<a href="data:application/zip;base64,{b64_data}" download="{filename}">Download Zip File</a>'
+    href = f'<a href="data:application/zip;base64,{b64_data}" download="{filename}" class="download-button">Download B-Roll ZIP File</a>'
     return href
 
-# Main App
-st.set_page_config(page_title="Script to B-Roll Finder", layout="wide")
+def auto_select_best_video(segment_key: str, videos: List[Dict[Any, Any]]) -> Dict[Any, Any]:
+    """Automatically select the best video for a segment."""
+    if not videos:
+        return None
+    
+    # Sort videos by score (highest first)
+    sorted_videos = sorted(videos, key=lambda x: x.get("score", 0), reverse=True)
+    
+    # Return the best video
+    return sorted_videos[0] if sorted_videos else None
 
-st.title("Script to B-Roll Finder")
-st.markdown("Upload or paste your script to find relevant B-roll footage")
-
-# User inputs
-script_text = st.text_area("Paste your script here:", height=200)
-segment_duration = st.slider("Segment duration (seconds):", 3, 5, 4)
-
-if st.button("Find B-Roll Footage") and script_text:
+def process_script(script_text: str, segment_duration: int) -> None:
+    """Process the entire script and automatically prepare videos for download."""
     # Parse script into segments
     segments = parse_script_into_segments(script_text, segment_duration)
+    st.session_state.segments = segments
+    
+    # Reset previously selected videos
+    st.session_state.selected_videos = {}
+    st.session_state.segment_videos = {}
+    st.session_state.all_videos = []
     
     # Create progress bar
     progress_bar = st.progress(0)
@@ -189,140 +309,208 @@ if st.button("Find B-Roll Footage") and script_text:
     # Create container for results
     results_container = st.container()
     
-    # Store all video data for download
-    all_videos = []
-    segment_videos = {}
-    
     with results_container:
-        st.subheader("B-Roll Suggestions")
+        st.subheader("B-Roll Processing Results")
         
         for i, segment in enumerate(segments):
             # Update progress
-            progress = (i + 1) / len(segments)
+            progress = (i + 1) / (len(segments) * 2)  # First half for searching
             progress_bar.progress(progress)
-            status_text.text(f"Processing segment {i+1} of {len(segments)}")
-            
-            st.markdown(f"### Segment {i+1}")
-            st.text(segment)
+            status_text.text(f"Finding videos for segment {i+1} of {len(segments)}")
             
             # Extract keywords from segment
             keywords = extract_keywords(segment)
             query = " ".join(keywords)
-            st.caption(f"Search query: {query}")
             
-            # Search for videos
-            videos = search_pexels_videos(query)
-            if videos:
-                segment_videos[f"segment_{i+1}"] = []
+            # Search for videos with segment for scoring
+            videos = search_pexels_videos(query, segment=segment)
+            
+            # Store segment key
+            segment_key = f"segment_{i+1}"
+            
+            # Store videos for this segment
+            st.session_state.segment_videos[segment_key] = videos
+            
+            # Automatically select best video
+            best_video = auto_select_best_video(segment_key, videos)
+            
+            if best_video:
+                # Create video info dictionary
+                video_info = {
+                    "segment": i+1,
+                    "segment_text": segment,
+                    "video_id": 1,  # Always 1 since we're only selecting the best
+                    "url": best_video.get("video_files", [{}])[0].get("link", ""),
+                    "filename": f"segment_{i+1}.mp4",
+                    "duration": best_video.get("duration", 0),
+                    "score": best_video.get("score", 0),
+                    "image_url": best_video.get("image", ""),
+                    "pexels_url": best_video.get("url", ""),
+                    "width": best_video.get("width", 0),
+                    "height": best_video.get("height", 0)
+                }
                 
-                cols = st.columns(min(4, len(videos)))
-                for j, video in enumerate(videos[:4]):
-                    with cols[j]:
-                        # Get the preview image
-                        image_url = video.get("image", "")
-                        
-                        # Display thumbnail
-                        st.image(image_url, use_column_width=True)
-                        
-                        # Get video dimensions for aspect ratio display
-                        width = video.get("width", 0)
-                        height = video.get("height", 0)
-                        aspect_ratio = f"{width}:{height}"
-                        
-                        # Get best video file (prefer HD, but fallback to others)
-                        video_files = video.get("video_files", [])
-                        download_url = ""
-                        
-                        # Try to find HD file first
-                        for file in video_files:
-                            if file.get("quality") == "hd":
-                                download_url = file.get("link", "")
-                                break
-                        
-                        # If no HD file, get the first one
-                        if not download_url and video_files:
-                            download_url = video_files[0].get("link", "")
-                        
-                        # Video details
-                        st.write(f"**Duration:** {video.get('duration', 0)}s")
-                        st.write(f"**Aspect Ratio:** {aspect_ratio}")
-                        
-                        # Create selection checkbox
-                        selected = st.checkbox(f"Select for segment {i+1}, video {j+1}")
-                        if selected:
-                            # Add to selected videos for download
-                            video_info = {
-                                "segment": i+1,
-                                "video_id": j+1,
-                                "url": download_url,
-                                "filename": f"segment_{i+1}_video_{j+1}.mp4"
-                            }
-                            segment_videos[f"segment_{i+1}"].append(video_info)
-                            all_videos.append(video_info)
-                        
-                        # Add link to Pexels page for attribution
-                        st.markdown(f"[View on Pexels]({video.get('url', '')})")
-            else:
-                st.warning("No 16:9 videos found for this segment. Try different keywords.")
-            
-            # Add a divider between segments
-            st.divider()
+                # Add to selected videos
+                st.session_state.selected_videos[segment_key] = [video_info]
+                st.session_state.all_videos.append(video_info)
             
             # Sleep to avoid hitting API rate limits
             time.sleep(0.5)
-    
-    # Complete progress bar
-    progress_bar.empty()
-    status_text.text("Processing complete!")
-    
-    # If videos were selected, show download option
-    if all_videos:
-        st.success(f"Found {len(all_videos)} B-roll clips for your script!")
         
-        if st.button("Prepare Download ZIP"):
-            # Download progress
-            download_progress = st.progress(0)
-            download_status = st.empty()
+        # Second phase: downloading and trimming
+        video_data = []
+        
+        for i, video_info in enumerate(st.session_state.all_videos):
+            # Update progress for download phase
+            progress = 0.5 + ((i + 1) / (len(st.session_state.all_videos) * 2))  # Second half for downloading
+            progress_bar.progress(progress)
+            status_text.text(f"Processing video {i+1} of {len(st.session_state.all_videos)}")
             
-            # Download all selected videos
-            download_status.text("Downloading videos...")
-            video_data = []
-            
-            for i, video_info in enumerate(all_videos):
-                download_progress.progress((i + 1) / len(all_videos))
-                download_status.text(f"Downloading video {i+1} of {len(all_videos)}...")
+            try:
+                # Download video
+                data = download_video(video_info["url"])
                 
-                try:
-                    data = download_video(video_info["url"])
-                    video_data.append({
-                        "filename": video_info["filename"],
-                        "data": data
-                    })
-                except Exception as e:
-                    st.error(f"Error downloading video {video_info['filename']}: {str(e)}")
-            
-            # Create zip file
-            download_status.text("Creating ZIP file...")
-            zip_data = create_zip_file(video_data)
-            
-            # Create download link
-            download_status.empty()
-            download_progress.empty()
-            
-            st.markdown(get_download_link(zip_data, "broll_footage.zip"), unsafe_allow_html=True)
-            st.success("ZIP file created! Click the link above to download.")
-    else:
-        st.info("No videos selected for download. Select videos to enable the download option.")
+                # Trim video to match segment duration
+                duration = video_info.get("duration", 0)
+                if duration > segment_duration:
+                    # Start after 10% of the video to skip intros
+                    start_time = min(duration * 0.1, duration - segment_duration)
+                else:
+                    start_time = 0
+                
+                # Trim to segment_duration or video duration, whichever is shorter
+                trim_duration = min(segment_duration, duration)
+                
+                # Trim the video
+                data = trim_video(data, start_time, trim_duration)
+                
+                # Store video data
+                video_data.append({
+                    "filename": video_info["filename"],
+                    "data": data
+                })
+                
+            except Exception as e:
+                st.error(f"Error processing video for segment {i+1}: {str(e)}")
+        
+        # Create zip file
+        status_text.text("Creating ZIP file...")
+        zip_data = create_zip_file(video_data)
+        
+        # Store zip data in session state
+        st.session_state.zip_data = zip_data
+        
+        # Complete progress
+        progress_bar.progress(1.0)
+        status_text.text("Processing complete!")
+        
+        # Mark as processed
+        st.session_state.searched = True
+        st.session_state.processing_complete = True
 
-st.markdown("---")
+# Main App
+st.set_page_config(page_title="Script to B-Roll Finder", layout="wide")
+
+# Custom CSS for better styling
 st.markdown("""
-### How to use this app:
-1. Paste your script in the text area
-2. Adjust segment duration if needed (3-5 seconds)
-3. Click "Find B-Roll Footage"
-4. Select the videos you want for each segment by checking the boxes
-5. Click "Prepare Download ZIP" to download all selected videos in a zip file
+<style>
+.download-button {
+    display: inline-block;
+    padding: 12px 24px;
+    background-color: #4CAF50;
+    color: white;
+    text-decoration: none;
+    font-weight: bold;
+    border-radius: 4px;
+    text-align: center;
+    transition: background-color 0.3s;
+    margin: 20px 0;
+}
+.download-button:hover {
+    background-color: #45a049;
+}
+.stButton>button {
+    width: 100%;
+}
+</style>
+""", unsafe_allow_html=True)
 
-#### Note:
-This app uses the Pexels API to find B-roll footage with focus on 16:9 aspect ratio and political/city themes. Make sure to credit Pexels and the creators when using the footage.
-""") 
+st.title("Automated Script to B-Roll Finder")
+st.markdown("Paste your script below to automatically find and download B-roll footage for each segment")
+
+# User inputs
+script_text = st.text_area("Paste your script here:", height=200)
+segment_duration = st.slider("Segment duration (seconds):", 3, 5, 4, help="Target duration for each script segment and corresponding B-roll clip")
+
+# Reset button to start over
+col1, col2 = st.columns([1, 3])
+with col1:
+    if st.button("Reset", help="Clear all results and start over"):
+        st.session_state.selected_videos = {}
+        st.session_state.segments = []
+        st.session_state.searched = False
+        st.session_state.segment_videos = {}
+        st.session_state.all_videos = []
+        st.session_state.zip_data = None
+        st.session_state.processing_complete = False
+        st.experimental_rerun()
+
+with col2:
+    if st.button("Process Script & Find B-Roll", type="primary", help="Automatically find, trim, and package B-roll footage for your script") and script_text:
+        process_script(script_text, segment_duration)
+
+# Display download section if processing is complete
+if st.session_state.processing_complete and st.session_state.zip_data:
+    st.success(f"🎉 Successfully found and processed B-roll for {len(st.session_state.all_videos)} script segments!")
+    
+    # Display download button
+    st.markdown(get_download_link(st.session_state.zip_data, "broll_footage.zip"), unsafe_allow_html=True)
+    
+    # Display summary of selected videos
+    with st.expander("View Selected B-Roll Details", expanded=False):
+        st.subheader("Selected B-Roll Videos")
+        
+        for i, video_info in enumerate(st.session_state.all_videos):
+            col1, col2 = st.columns([1, 3])
+            
+            with col1:
+                st.image(video_info.get("image_url", ""), use_column_width=True)
+            
+            with col2:
+                st.markdown(f"### Segment {i+1}")
+                st.text(video_info.get("segment_text", ""))
+                st.write(f"**Duration:** {video_info.get('duration', 0)}s (trimmed to {segment_duration}s)")
+                st.write(f"**Resolution:** {video_info.get('width', 0)}x{video_info.get('height', 0)}")
+                st.write(f"**Match Score:** {video_info.get('score', 0):.1f}")
+                st.markdown(f"[View on Pexels]({video_info.get('pexels_url', '')})")
+            
+            st.divider()
+
+# Show appropriate message if script is being processed
+elif st.session_state.searched and not st.session_state.processing_complete:
+    st.info("Still processing your script. Please wait...")
+
+# Show instructions for first-time users
+elif not st.session_state.searched:
+    st.markdown("""
+    ### How to use this app:
+    1. Paste your script in the text area above
+    2. Adjust the segment duration if needed (3-5 seconds)
+    3. Click "Process Script & Find B-Roll"
+    4. Wait for processing to complete (it may take a few minutes)
+    5. Download the ZIP file containing all B-roll videos
+
+    #### What happens behind the scenes:
+    - Your script is broken into segments based on estimated speaking time
+    - Each segment is analyzed to extract key topics
+    - The app finds the most relevant 16:9 videos for each segment
+    - Videos are automatically trimmed to match your segment duration
+    - All videos are packaged into a single ZIP file for easy download
+    
+    #### Note:
+    This app uses the Pexels API to find free stock footage. Make sure to credit Pexels and the video creators when using the footage.
+    """)
+
+# Footer with attribution
+st.markdown("---")
+st.caption("Powered by Pexels API | Stock footage provided by Pexels.com") 
